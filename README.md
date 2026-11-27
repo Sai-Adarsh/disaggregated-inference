@@ -21,7 +21,7 @@ In a second terminal:
 
 `compare` drops one warmup pair and alternates run order. It exits on the first mismatch and writes two CSV rows per confirmed pair. Both `ttft_ms` and `total_ms` start at client prefill. For the split path, TTFT stops at the first token and total time stops at a valid completion record. `connect_send_ms` includes connection setup, serialization, and the client send. The worker times receive and decode locally. The monolithic GPU path reuses device-resident K/V. The split GPU path stages the state in host memory.
 
-`serve` accepts one request. `serve-loop` takes 1–64 worker threads and leaves excess connections in the transport backlog. Established TCP connections have a 30-second idle read and write timeout on both endpoints. Multiple CUDA handlers share the default device stream.
+`serve` accepts one request. `serve-loop` takes 1–64 worker threads and leaves excess connections in the transport backlog. TCP clients have a 30-second connection deadline. Both endpoints also have a 30-second idle timeout for reads and writes after connection. Multiple CUDA handlers share the default device stream.
 
 ### Recorded loopback run
 
@@ -61,7 +61,7 @@ The rsocket path transfers host buffers, so this experiment includes GPU-to-host
 
 ## Tests and coverage
 
-The suite starts TCP workers on ephemeral loopback ports. It checks causal prefix invariance, streamed tokens, split-versus-local parity, invalid frames, idle timeouts on both endpoints, and signal interruption. It sends complete token streams with missing, truncated, and invalid completion frames and checks that the client rejects them. For a bounded worker run, pass a connection limit after the backend. Server port `0` asks the OS for a free port, which appears in the worker log. The worker drains accepted connections before exiting.
+The suite starts TCP workers on ephemeral loopback ports. It checks causal prefix invariance, streamed tokens, split-versus-local parity, invalid frames, idle timeouts on both endpoints, and signal interruption. On Linux it also checks that a client times out when the accept queue is full. It sends complete token streams with missing, truncated, and invalid completion frames and checks that the client rejects them. For a bounded worker run, pass a connection limit after the backend. Server port `0` asks the OS for a free port, which appears in the worker log. The worker drains accepted connections before exiting.
 
 ```sh
 cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \

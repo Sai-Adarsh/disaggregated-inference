@@ -28,7 +28,7 @@ using Clock = std::chrono::steady_clock;
 constexpr std::uint32_t protocol = 0x4b563033;  // KV03, confirms decode completion
 constexpr std::uint32_t completion_magic = 0x444f4e45;  // DONE
 constexpr int max_decode_workers = 64;
-constexpr std::chrono::seconds tcp_idle_timeout{30};
+constexpr std::chrono::seconds tcp_timeout{30};
 std::mutex decode_log_mutex;
 
 double milliseconds(Clock::duration duration) {
@@ -150,7 +150,7 @@ public:
             slot_available_.wait(lock, [this] { return in_flight_ < capacity_; });
             lock.unlock();
 
-            auto client = listener.accept(tcp_idle_timeout);
+            auto client = listener.accept(tcp_timeout);
             lock.lock();
             pending_.push_back(std::move(client));
             ++in_flight_;
@@ -203,7 +203,7 @@ void serve(Stream::Kind transport, std::string_view address, int port, bool gpu,
     const auto bound_port = listener.local_port();
     if (workers == 0) {
         std::cerr << "listening on " << address << ':' << bound_port << '\n';
-        decode_request(listener.accept(tcp_idle_timeout), gpu);
+        decode_request(listener.accept(tcp_timeout), gpu);
         return;
     }
 
@@ -241,7 +241,7 @@ Measurement split(Stream::Kind transport, std::string_view address, int port,
     const auto computed = Clock::now();
     measured.payload_bytes = cache.payload_bytes();
     measured.prefill_ms = milliseconds(computed - start);
-    const auto stream = Stream::connect(transport, address, port, tcp_idle_timeout);
+    const auto stream = Stream::connect(transport, address, port, tcp_timeout);
     write_cache(stream, cache, steps);
     measured.connect_send_ms = milliseconds(Clock::now() - computed);
     constexpr std::string_view vocabulary{fixture::vocabulary};

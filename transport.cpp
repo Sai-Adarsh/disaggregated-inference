@@ -1,7 +1,9 @@
 #include "transport.hpp"
 
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -10,7 +12,9 @@
 #include <rdma/rsocket.h>
 #endif
 
+#include <algorithm>
 #include <cerrno>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -32,6 +36,42 @@ void configure_tcp(int fd, std::chrono::seconds idle_timeout) {
     timeout.tv_sec = idle_timeout.count();
     check(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), "set TCP receive timeout");
     check(setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)), "set TCP send timeout");
+}
+
+void connect_tcp(int fd, const sockaddr* target, socklen_t length, std::chrono::seconds timeout) {
+    if (timeout.count() <= 0) {
+        check(::connect(fd, target, length), "connect");
+        return;
+    }
+
+    const int flags = fcntl(fd, F_GETFL);
+    check(flags, "read TCP socket flags");
+    check(fcntl(fd, F_SETFL, flags | O_NONBLOCK), "set TCP socket nonblocking");
+    const auto started = std::chrono::steady_clock::now();
+    if (::connect(fd, target, length) < 0) {
+        if (errno != EINPROGRESS && errno != EINTR) check(-1, "connect");
+
+        using Milliseconds = std::chrono::duration<double, std::milli>;
+        constexpr Milliseconds max_poll_wait{std::numeric_limits<int>::max()};
+        pollfd socket{fd, POLLOUT, 0};
+        for (;;) {
+            const auto elapsed = std::chrono::steady_clock::now() - started;
+            const auto remaining = Milliseconds{timeout} - Milliseconds{elapsed};
+            if (remaining <= Milliseconds::zero()) {
+                throw std::system_error(std::make_error_code(std::errc::timed_out), "TCP connect");
+            }
+            const auto wait = std::chrono::ceil<std::chrono::milliseconds>(std::min(remaining, max_poll_wait));
+            const int ready = poll(&socket, 1, static_cast<int>(wait.count()));
+            if (ready == 0 || (ready < 0 && errno == EINTR)) continue;
+            check(ready, "poll TCP connect");
+            break;
+        }
+        int error = 0;
+        socklen_t size = sizeof(error);
+        check(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &size), "check TCP connect");
+        if (error != 0) throw std::system_error(error, std::generic_category(), "connect");
+    }
+    check(fcntl(fd, F_SETFL, flags), "restore TCP socket flags");
 }
 
 sockaddr_in endpoint(std::string_view address, std::uint16_t port) {
@@ -101,7 +141,7 @@ Stream Stream::listen(Kind kind, std::string_view address, std::uint16_t port) {
 }
 
 Stream Stream::connect(Kind kind, std::string_view address, std::uint16_t port,
-                       std::chrono::seconds tcp_idle_timeout) {
+                       std::chrono::seconds tcp_timeout) {
     const auto target = endpoint(address, port);
     const auto* target_address = reinterpret_cast<const sockaddr*>(&target);
     const int fd = open(kind);
@@ -112,8 +152,8 @@ Stream Stream::connect(Kind kind, std::string_view address, std::uint16_t port,
         } else
 #endif
         {
-            check(::connect(fd, target_address, sizeof(target)), "connect");
-            configure_tcp(fd, tcp_idle_timeout);
+            connect_tcp(fd, target_address, sizeof(target), tcp_timeout);
+            configure_tcp(fd, tcp_timeout);
         }
     } catch (...) {
         const Stream cleanup(kind, fd);
