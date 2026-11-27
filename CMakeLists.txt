@@ -24,3 +24,22 @@ if(ENABLE_CUDA)
     target_link_libraries(split_inference PRIVATE CUDA::cudart)
     target_compile_definitions(split_inference PRIVATE INFERENCE_CUDA)
 endif()
+
+include(CTest)
+if(BUILD_TESTING)
+    add_executable(split_inference_tests tests/transport_tests.cpp model.cpp transport.cpp)
+    target_include_directories(split_inference_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_features(split_inference_tests PRIVATE cxx_std_20)
+    target_link_libraries(split_inference_tests PRIVATE Threads::Threads)
+    if(ENABLE_RDMA)
+        target_include_directories(split_inference_tests PRIVATE "${RSOCKET_INCLUDE_DIR}")
+        target_link_libraries(split_inference_tests PRIVATE "${RDMACM_LIBRARY}")
+        target_compile_definitions(split_inference_tests PRIVATE INFERENCE_RDMA)
+    endif()
+    add_test(NAME split_transport_cpu COMMAND split_inference_tests "$<TARGET_FILE:split_inference>")
+    add_test(NAME split_cli_errors
+        COMMAND "${CMAKE_COMMAND}" "-DPROGRAM=$<TARGET_FILE:split_inference>"
+                "-DCUDA_ENABLED=${ENABLE_CUDA}" "-DRDMA_ENABLED=${ENABLE_RDMA}"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/cli.cmake")
+    set_tests_properties(split_transport_cpu split_cli_errors PROPERTIES TIMEOUT 30)
+endif()

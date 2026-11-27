@@ -137,8 +137,8 @@ public:
         }
     }
 
-    void accept_connections(const Stream& listener) {
-        for (;;) {
+    void accept_connections(const Stream& listener, int request_limit) {
+        for (int accepted = 0; request_limit == 0 || accepted < request_limit;) {
             std::unique_lock lock(mutex_);
             slot_available_.wait(lock, [this] { return in_flight_ < capacity_; });
             lock.unlock();
@@ -147,6 +147,7 @@ public:
             lock.lock();
             pending_.push_back(std::move(client));
             ++in_flight_;
+            if (request_limit != 0) ++accepted;
             lock.unlock();
             work_available_.notify_one();
         }
@@ -189,17 +190,19 @@ private:
     std::vector<std::jthread> workers_;
 };
 
-void serve(Stream::Kind transport, std::string_view address, int port, bool gpu, int workers = 0) {
+void serve(Stream::Kind transport, std::string_view address, int port, bool gpu,
+           int workers = 0, int request_limit = 0) {
     const auto listener = Stream::listen(transport, address, port);
+    const auto bound_port = listener.local_port();
     if (workers == 0) {
-        std::cerr << "listening on " << address << ':' << port << '\n';
+        std::cerr << "listening on " << address << ':' << bound_port << '\n';
         decode_request(listener.accept(), gpu);
         return;
     }
 
     DecodeWorkers pool(workers, gpu);
-    std::cerr << "listening on " << address << ':' << port << " workers=" << workers << '\n';
-    pool.accept_connections(listener);
+    std::cerr << "listening on " << address << ':' << bound_port << " workers=" << workers << '\n';
+    pool.accept_connections(listener, request_limit);
 }
 
 struct Measurement {
@@ -317,7 +320,7 @@ int main(int argc, char** argv) try {
     std::signal(SIGPIPE, SIG_IGN);
     if (argc < 5) {
         throw std::invalid_argument("usage: split_inference serve tcp|rdma IP PORT [cpu|cuda]\n"
-                                    "       split_inference serve-loop tcp|rdma IP PORT WORKERS [cpu|cuda]\n"
+                                    "       split_inference serve-loop tcp|rdma IP PORT WORKERS [cpu|cuda] [CONNECTIONS]\n"
                                     "       split_inference prefill tcp|rdma IP PORT PROMPT STEPS [cpu|cuda]\n"
                                     "       split_inference compare tcp|rdma IP PORT PROMPT STEPS TRIALS [cpu|cuda]");
     }
@@ -327,12 +330,13 @@ int main(int argc, char** argv) try {
         throw std::invalid_argument("expected tcp or rdma transport");
     }
     const auto transport = protocol_name == "rdma" ? Stream::Kind::Rdma : Stream::Kind::Tcp;
-    const auto port = parse_int(argv[4], 1, 65535);
+    const auto port = parse_int(argv[4], mode == "serve" || mode == "serve-loop" ? 0 : 1, 65535);
     if (mode == "serve" && (argc == 5 || argc == 6)) {
         serve(transport, argv[3], port, use_cuda(argc == 6 ? argv[5] : "cpu"));
-    } else if (mode == "serve-loop" && (argc == 6 || argc == 7)) {
+    } else if (mode == "serve-loop" && argc >= 6 && argc <= 8) {
         const int workers = parse_int(argv[5], 1, max_decode_workers);
-        serve(transport, argv[3], port, use_cuda(argc == 7 ? argv[6] : "cpu"), workers);
+        const int request_limit = argc == 8 ? parse_int(argv[7], 1, 1000000) : 0;
+        serve(transport, argv[3], port, use_cuda(argc >= 7 ? argv[6] : "cpu"), workers, request_limit);
     } else if (mode == "prefill" && (argc == 7 || argc == 8)) {
         prefill(transport, argv[3], port, argv[5], parse_int(argv[6], 1, fixture::max_generated),
                 use_cuda(argc == 8 ? argv[7] : "cpu"));
