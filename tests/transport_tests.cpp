@@ -4,6 +4,7 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -211,6 +212,56 @@ void tcp_transport() {
         [&] { Stream::connect(tcp, loopback, unused, 1s); }, "connect");
 }
 
+void tcp_write_after_reset() {
+    const auto child = fork();
+    require(child >= 0, "start TCP reset watchdog");
+    if (child == 0) {
+        alarm(5);
+        if (std::signal(SIGPIPE, SIG_DFL) == SIG_ERR) _exit(2);
+        try {
+            auto listener = Stream::listen(tcp, loopback, 0);
+            sockaddr_in target{};
+            target.sin_family = AF_INET;
+            target.sin_port = htons(listener.local_port());
+            target.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            const int client = socket(AF_INET, SOCK_STREAM, 0);
+            if (client < 0 || connect(client, reinterpret_cast<const sockaddr*>(&target), sizeof(target)) < 0) {
+                _exit(3);
+            }
+            auto peer = listener.accept(1s);
+            const linger abortive_close{1, 0};
+            if (setsockopt(client, SOL_SOCKET, SO_LINGER, &abortive_close, sizeof(abortive_close)) < 0 ||
+                close(client) < 0) {
+                _exit(4);
+            }
+
+            unsigned char byte = 0;
+            try {
+                peer.receive(&byte, 1);
+                _exit(5);
+            } catch (const std::system_error& error) {
+                if (error.code() != std::errc::connection_reset) _exit(6);
+            }
+            try {
+                peer.send(&byte, 1);
+                _exit(7);
+            } catch (const std::system_error& error) {
+                _exit(error.code() == std::errc::broken_pipe ? 0 : 8);
+            }
+        } catch (...) {
+            _exit(9);
+        }
+    }
+
+    int status = 0;
+    pid_t waited = -1;
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    require(waited == child, "wait for TCP reset watchdog");
+    require(!(WIFSIGNALED(status) && WTERMSIG(status) == SIGPIPE), "TCP send raised SIGPIPE after peer reset");
+    require(WIFEXITED(status) && WEXITSTATUS(status) == 0,
+            "TCP send did not return a broken-pipe error after peer reset (wait status " + std::to_string(status) + ')');
+}
+
 #ifdef __linux__
 void tcp_connect_deadline() {
     auto listener = Stream::listen(tcp, loopback, 0);
@@ -397,6 +448,7 @@ int main(int argc, char** argv) try {
     const TempDir temp;
     model_prefix();
     tcp_transport();
+    tcp_write_after_reset();
 #ifdef __linux__
     tcp_connect_deadline();
 #endif
