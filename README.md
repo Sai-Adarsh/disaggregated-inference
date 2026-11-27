@@ -1,6 +1,6 @@
 # Disaggregated prefill and decode
 
-The synthetic decoder has two attention layers, four heads per layer, a hidden width of 64, and a 27-byte output vocabulary. Prefill applies dense Q/K/V projections, causal scaled dot-product softmax, and a residual output projection at every prompt position. The second layer consumes the first layer's output. The split worker receives both layers' K/V and the last hidden row, then emits the same greedy tokens as a local run. Weights are deterministic and untrained.
+The synthetic decoder has two attention layers, four heads per layer, a hidden width of 64, and a 27-byte output vocabulary. Prefill applies dense Q/K/V projections, causal scaled dot-product softmax, and a residual output projection at every prompt position. The second layer consumes the first layer's output. The split worker receives both layers' K/V and the last hidden row. The paired command checks greedy output against a local run for the chosen prompt and backend. The recorded CPU loopback matched exactly. Weights are deterministic and untrained.
 
 The KV02 frame contains the version, prompt length and generation length, followed by network-order FP32 arrays. Both sides must use KV02. For a prompt with `T` bytes the state payload is `4 × (2 × 2 × T × 64 + 64)` bytes, plus a 12-byte header. Prefill performs quadratic attention work. Each new generated token attends over the cached prefix once per layer.
 
