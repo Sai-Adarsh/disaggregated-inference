@@ -10,7 +10,8 @@ public:
     enum class Kind { Tcp, Rdma };
 
     static Stream listen(Kind kind, std::string_view address, std::uint16_t port);
-    static Stream connect(Kind kind, std::string_view address, std::uint16_t port);
+    static Stream connect(Kind kind, std::string_view address, std::uint16_t port,
+                          std::chrono::seconds tcp_idle_timeout = {});
     Stream accept(std::chrono::seconds tcp_idle_timeout = {}) const;
     std::uint16_t local_port() const;
     void send(const void* data, std::size_t bytes) const;

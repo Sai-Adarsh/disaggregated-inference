@@ -24,12 +24,10 @@ void check(ssize_t result, const char* operation) {
     }
 }
 
-void set_tcp_no_delay(int fd) {
+void configure_tcp(int fd, std::chrono::seconds idle_timeout) {
     const int on = 1;
     check(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)), "setsockopt");
-}
-
-void set_tcp_idle_timeout(int fd, std::chrono::seconds idle_timeout) {
+    if (idle_timeout.count() <= 0) return;
     timeval timeout{};
     timeout.tv_sec = idle_timeout.count();
     check(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), "set TCP receive timeout");
@@ -102,7 +100,8 @@ Stream Stream::listen(Kind kind, std::string_view address, std::uint16_t port) {
     }
 }
 
-Stream Stream::connect(Kind kind, std::string_view address, std::uint16_t port) {
+Stream Stream::connect(Kind kind, std::string_view address, std::uint16_t port,
+                       std::chrono::seconds tcp_idle_timeout) {
     const auto target = endpoint(address, port);
     const auto* target_address = reinterpret_cast<const sockaddr*>(&target);
     const int fd = open(kind);
@@ -114,7 +113,7 @@ Stream Stream::connect(Kind kind, std::string_view address, std::uint16_t port) 
 #endif
         {
             check(::connect(fd, target_address, sizeof(target)), "connect");
-            set_tcp_no_delay(fd);
+            configure_tcp(fd, tcp_idle_timeout);
         }
     } catch (...) {
         const Stream cleanup(kind, fd);
@@ -138,10 +137,7 @@ Stream Stream::accept(std::chrono::seconds tcp_idle_timeout) const {
     check(fd, "accept");
     try {
         if (kind_ == Kind::Tcp) {
-            set_tcp_no_delay(fd);
-            if (tcp_idle_timeout.count() > 0) {
-                set_tcp_idle_timeout(fd, tcp_idle_timeout);
-            }
+            configure_tcp(fd, tcp_idle_timeout);
         }
     } catch (...) {
         const Stream cleanup(kind_, fd);
