@@ -58,3 +58,21 @@ cmake --build build-rdma -j
 The rsocket path transfers host buffers, so this experiment includes GPU-to-host and host-to-GPU copies. The H100/L40 comparison above has not been run. It measures the configured two-host split against the H100-only baseline; repeat with a colocated TCP control and record hardware, link, and prompt length before attributing differences to RDMA. This fixture does not measure checkpoint throughput, saturated model FLOP utilization, GPUDirect RDMA, or continuous batching.
 
 [rdma-core rsocket API](https://github.com/linux-rdma/rdma-core/blob/master/librdmacm/man/rsocket.7.in)
+
+## Tests and coverage
+
+The suite starts real TCP workers on ephemeral loopback ports. It checks two-layer causal prefix invariance, streamed tokens, split-versus-local comparison, invalid frames, socket timeout, signal interruption, and parity rejection. For a bounded worker run, pass a connection limit after the backend. Server port `0` asks the OS for a free port, which appears in the worker log. The worker drains accepted connections before exiting.
+
+```sh
+cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping"
+cmake --build build/coverage -j
+profiles="$(mktemp -d)"
+LLVM_PROFILE_FILE="$profiles/%m-%p.profraw" ctest --test-dir build/coverage --output-on-failure
+xcrun llvm-profdata merge -sparse "$profiles"/*.profraw -o "$profiles/merged.profdata"
+xcrun llvm-cov report build/coverage/split_inference \
+  -object build/coverage/split_inference_tests -instr-profile="$profiles/merged.profdata" \
+  --show-branch-summary main.cpp model.cpp transport.cpp model.hpp feature.hpp transport.hpp
+```
+
+On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The AppleClang CPU run covered 547/552 lines (99.09%) and 174/205 branches (84.88%). Uncovered CPU lines include transport initialization failure after accept and a zero-byte send. The optional CUDA and RDMA implementations require their own builds and hardware.

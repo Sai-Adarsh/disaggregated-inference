@@ -150,6 +150,21 @@ Stream Stream::accept(std::chrono::seconds tcp_idle_timeout) const {
     return Stream(kind_, fd);
 }
 
+std::uint16_t Stream::local_port() const {
+    sockaddr_in address{};
+    auto size = static_cast<socklen_t>(sizeof(address));
+    auto* name = reinterpret_cast<sockaddr*>(&address);
+#ifdef INFERENCE_RDMA
+    if (kind_ == Kind::Rdma) {
+        check(rgetsockname(descriptor_, name, &size), "rgetsockname");
+    } else
+#endif
+    {
+        check(getsockname(descriptor_, name, &size), "getsockname");
+    }
+    return ntohs(address.sin_port);
+}
+
 void Stream::send(const void* data, std::size_t remaining) const {
     const auto* current = static_cast<const unsigned char*>(data);
     while (remaining != 0) {
