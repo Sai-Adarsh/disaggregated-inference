@@ -314,7 +314,8 @@ void parity_rejects(const char* exe, const std::filesystem::path& scratch) {
     auto peer = listener.accept(1s);
     std::array<std::uint32_t, 3 + (2 * fixture::layers + 1) * fixture::width> request{};
     peer.receive(request.data(), sizeof(request));
-    const unsigned char wrong = '!';
+    const auto expected = generation(fixture::prefill_cpu("x"), 1);
+    const unsigned char wrong = expected.front() == 'a' ? 'b' : 'a';
     peer.send(&wrong, 1);
     const std::array completion{htonl(done), htonl(1)};
     peer.send(completion.data(), sizeof(completion));
@@ -325,7 +326,7 @@ void completion_required(const char* exe, const std::filesystem::path& scratch) 
     auto listener = Stream::listen(tcp, loopback, 0);
     const auto port = std::to_string(listener.local_port());
     const auto simulate = [&](std::string label, const std::vector<std::uint32_t>& trailer,
-                              std::string_view error) {
+                              std::string_view error, bool invalid_token = false) {
         Child client(exe, scratch, std::move(label),
             {"prefill", "tcp", std::string(loopback), port, "x", "1"});
         {
@@ -333,12 +334,13 @@ void completion_required(const char* exe, const std::filesystem::path& scratch) 
             std::array<std::uint32_t, 3 + (2 * fixture::layers + 1) * fixture::width> request{};
             peer.receive(request.data(), sizeof(request));
             require(ntohl(request[0]) == kv03, "client did not request version KV03");
-            const auto correct = generation(fixture::prefill_cpu("x"), 1);
-            peer.send(correct.data(), correct.size());
+            const auto token = invalid_token ? std::string("!") : generation(fixture::prefill_cpu("x"), 1);
+            peer.send(token.data(), token.size());
             if (!trailer.empty()) peer.send(trailer.data(), trailer.size() * sizeof(trailer[0]));
         }
         expect_exit(client, 1, error);
-        require(client.stdout_text().size() == 1, "incomplete stream reported success");
+        require(client.stdout_text().size() == (invalid_token ? 0 : 1),
+                "invalid token was printed or incomplete stream reported success");
         require(client.stderr_text().find("total_ms=") == std::string::npos,
                 "incomplete stream was included in timing");
     };
@@ -346,6 +348,7 @@ void completion_required(const char* exe, const std::filesystem::path& scratch) 
     simulate("half-completion", {htonl(done)}, "decode completion was not received");
     simulate("wrong-count", {htonl(done), htonl(0)}, "invalid decode completion");
     simulate("wrong-marker", {htonl(kv03), htonl(1)}, "invalid decode completion");
+    simulate("invalid-token", {htonl(done), htonl(1)}, "invalid decode token", true);
 }
 
 }  // namespace
