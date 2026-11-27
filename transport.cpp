@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #ifdef INFERENCE_RDMA
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace {
 
@@ -25,6 +27,13 @@ void check(ssize_t result, const char* operation) {
 void set_tcp_no_delay(int fd) {
     const int on = 1;
     check(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)), "setsockopt");
+}
+
+void set_tcp_idle_timeout(int fd, std::chrono::seconds idle_timeout) {
+    timeval timeout{};
+    timeout.tv_sec = idle_timeout.count();
+    check(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)), "set TCP receive timeout");
+    check(setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)), "set TCP send timeout");
 }
 
 sockaddr_in endpoint(std::string_view address, std::uint16_t port) {
@@ -54,7 +63,13 @@ int Stream::open(Kind kind) {
     return fd;
 }
 
+Stream::Stream(Stream&& other) noexcept
+    : kind_(other.kind_), descriptor_(std::exchange(other.descriptor_, -1)) {}
+
 Stream::~Stream() {
+    if (descriptor_ < 0) {
+        return;
+    }
 #ifdef INFERENCE_RDMA
     if (kind_ == Kind::Rdma) {
         rclose(descriptor_);
@@ -108,7 +123,7 @@ Stream Stream::connect(Kind kind, std::string_view address, std::uint16_t port) 
     return Stream(kind, fd);
 }
 
-Stream Stream::accept() const {
+Stream Stream::accept(std::chrono::seconds tcp_idle_timeout) const {
     int fd = -1;
     do {
 #ifdef INFERENCE_RDMA
@@ -124,6 +139,9 @@ Stream Stream::accept() const {
     try {
         if (kind_ == Kind::Tcp) {
             set_tcp_no_delay(fd);
+            if (tcp_idle_timeout.count() > 0) {
+                set_tcp_idle_timeout(fd, tcp_idle_timeout);
+            }
         }
     } catch (...) {
         const Stream cleanup(kind_, fd);
