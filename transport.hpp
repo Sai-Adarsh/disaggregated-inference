@@ -1,5 +1,6 @@
 #pragma once
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
@@ -10,12 +11,13 @@ public:
 
     static Stream listen(Kind kind, std::string_view address, std::uint16_t port);
     static Stream connect(Kind kind, std::string_view address, std::uint16_t port);
-    Stream accept() const;
+    Stream accept(std::chrono::seconds tcp_idle_timeout = {}) const;
     void send(const void* data, std::size_t bytes) const;
     void receive(void* data, std::size_t bytes) const;
 
     Stream(const Stream&) = delete;
     Stream& operator=(const Stream&) = delete;
+    Stream(Stream&& other) noexcept;
     ~Stream();
 
 private:

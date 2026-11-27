@@ -8,16 +8,25 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <csignal>
+#include <deque>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
+#include <stop_token>
 #include <string_view>
+#include <thread>
 #include <utility>
+#include <vector>
 
 namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr std::uint32_t protocol = 0x4b563031;  // KV01
+constexpr int max_decode_workers = 64;
+constexpr std::chrono::seconds tcp_idle_timeout{30};
+std::mutex decode_log_mutex;
 
 double milliseconds(Clock::duration duration) {
     return std::chrono::duration<double, std::milli>(duration).count();
@@ -90,10 +99,7 @@ fixture::Cache read_cache(const Stream& stream, int& steps) {
     return cache;
 }
 
-void serve(Stream::Kind transport, std::string_view address, int port, bool gpu) {
-    const auto listener = Stream::listen(transport, address, port);
-    std::cerr << "listening on " << address << ':' << port << '\n';
-    const auto client = listener.accept();
+void decode_request(const Stream& client, bool gpu) {
     const auto start = Clock::now();
     int steps = 0;
     auto cache = read_cache(client, steps);
@@ -108,9 +114,84 @@ void serve(Stream::Kind transport, std::string_view address, int port, bool gpu)
         fixture::decode_cpu(std::move(cache), steps, emit);
     }
     const auto finished = Clock::now();
+    const std::lock_guard lock(decode_log_mutex);
     std::cerr << "backend=" << (gpu ? "cuda" : "cpu")
               << " decode_tokens=" << steps << " receive_ms=" << milliseconds(received - start)
               << " decode_ms=" << milliseconds(finished - received) << '\n';
+}
+
+class DecodeWorkers {
+public:
+    DecodeWorkers(int capacity, bool gpu) : capacity_(capacity), gpu_(gpu) {
+        workers_.reserve(capacity_);
+        for (int i = 0; i < capacity_; ++i) {
+            workers_.emplace_back([this](std::stop_token stop) { run(stop); });
+        }
+    }
+
+    void accept_connections(const Stream& listener) {
+        for (;;) {
+            std::unique_lock lock(mutex_);
+            slot_available_.wait(lock, [this] { return in_flight_ < capacity_; });
+            lock.unlock();
+
+            auto client = listener.accept(tcp_idle_timeout);
+            lock.lock();
+            pending_.push_back(std::move(client));
+            ++in_flight_;
+            lock.unlock();
+            work_available_.notify_one();
+        }
+    }
+
+private:
+    void run(std::stop_token stop) {
+        for (;;) {
+            {
+                std::unique_lock lock(mutex_);
+                if (!work_available_.wait(lock, stop, [this] { return !pending_.empty(); })) {
+                    return;
+                }
+                auto client = std::move(pending_.front());
+                pending_.pop_front();
+                lock.unlock();
+                try {
+                    decode_request(client, gpu_);
+                } catch (const std::exception& error) {
+                    const std::lock_guard log_lock(decode_log_mutex);
+                    std::cerr << "decode request failed: " << error.what() << '\n';
+                }
+            }
+            {
+                const std::lock_guard lock(mutex_);
+                --in_flight_;
+            }
+            slot_available_.notify_one();
+        }
+    }
+
+    int capacity_;
+    bool gpu_;
+    int in_flight_ = 0;
+    std::mutex mutex_;
+    std::condition_variable slot_available_;
+    std::condition_variable_any work_available_;
+    std::deque<Stream> pending_;
+    // Worker threads join before the synchronization state is destroyed.
+    std::vector<std::jthread> workers_;
+};
+
+void serve(Stream::Kind transport, std::string_view address, int port, bool gpu, int workers = 0) {
+    const auto listener = Stream::listen(transport, address, port);
+    if (workers == 0) {
+        std::cerr << "listening on " << address << ':' << port << '\n';
+        decode_request(listener.accept(), gpu);
+        return;
+    }
+
+    DecodeWorkers pool(workers, gpu);
+    std::cerr << "listening on " << address << ':' << port << " workers=" << workers << '\n';
+    pool.accept_connections(listener);
 }
 
 void prefill(Stream::Kind transport, std::string_view address, int port,
@@ -152,6 +233,7 @@ int main(int argc, char** argv) try {
     std::signal(SIGPIPE, SIG_IGN);
     if (argc < 5) {
         throw std::invalid_argument("usage: split_inference serve tcp|rdma IP PORT [cpu|cuda]\n"
+                                    "       split_inference serve-loop tcp|rdma IP PORT WORKERS [cpu|cuda]\n"
                                     "       split_inference prefill tcp|rdma IP PORT PROMPT STEPS [cpu|cuda]");
     }
     const std::string_view mode = argv[1];
@@ -163,6 +245,9 @@ int main(int argc, char** argv) try {
     const auto port = parse_int(argv[4], 1, 65535);
     if (mode == "serve" && (argc == 5 || argc == 6)) {
         serve(transport, argv[3], port, use_cuda(argc == 6 ? argv[5] : "cpu"));
+    } else if (mode == "serve-loop" && (argc == 6 || argc == 7)) {
+        const int workers = parse_int(argv[5], 1, max_decode_workers);
+        serve(transport, argv[3], port, use_cuda(argc == 7 ? argv[6] : "cpu"), workers);
     } else if (mode == "prefill" && (argc == 7 || argc == 8)) {
         prefill(transport, argv[3], port, argv[5], parse_int(argv[6], 1, fixture::max_generated),
                 use_cuda(argc == 8 ? argv[7] : "cpu"));

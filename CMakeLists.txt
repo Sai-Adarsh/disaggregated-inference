@@ -3,8 +3,10 @@ project(disaggregated_inference LANGUAGES CXX)
 
 option(ENABLE_RDMA "Enable librdmacm rsockets" OFF)
 option(ENABLE_CUDA "Enable CUDA attention fixture" OFF)
+find_package(Threads REQUIRED)
 add_executable(split_inference main.cpp model.cpp transport.cpp)
 target_compile_features(split_inference PRIVATE cxx_std_20)
+target_link_libraries(split_inference PRIVATE Threads::Threads)
 
 if(ENABLE_RDMA)
     find_path(RSOCKET_INCLUDE_DIR rdma/rsocket.h REQUIRED)
