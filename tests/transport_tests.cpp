@@ -207,7 +207,40 @@ void tcp_transport() {
         rejects<std::system_error>([&] { moved.receive(result.data(), 1); }, "receive");
     }
     rejects<std::system_error>([&] { Stream::connect(tcp, loopback, unused); }, "connect");
+    rejects<std::system_error>(
+        [&] { Stream::connect(tcp, loopback, unused, 1s); }, "connect");
 }
+
+#ifdef __linux__
+void tcp_connect_deadline() {
+    auto listener = Stream::listen(tcp, loopback, 0);
+    const auto port = listener.local_port();
+    // Linux queues backlog + 1 completed handshakes while no one accepts.
+    std::vector<Stream> pending;
+    for (int connection = 0; connection < 9; ++connection) {
+        pending.push_back(Stream::connect(tcp, loopback, port, 1s));
+    }
+
+    const auto child = fork();
+    require(child >= 0, "start connect deadline watchdog");
+    if (child == 0) {
+        alarm(4);
+        try {
+            const auto stalled = Stream::connect(tcp, loopback, port, 1s);
+            _exit(2);
+        } catch (const std::system_error& error) {
+            _exit(error.code() == std::errc::timed_out ? 0 : 3);
+        } catch (...) {
+            _exit(4);
+        }
+    }
+    int status = 0;
+    pid_t waited = -1;
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    require(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+            "TCP connect did not return a deadline error for a full accept queue");
+}
+#endif
 
 void interrupted_transport() {
     struct SignalGuard {
@@ -360,6 +393,9 @@ int main(int argc, char** argv) try {
     const TempDir temp;
     model_prefix();
     tcp_transport();
+#ifdef __linux__
+    tcp_connect_deadline();
+#endif
     interrupted_transport();
     protocol(argv[1], temp.path);
     parity_rejects(argv[1], temp.path);
