@@ -253,28 +253,32 @@ void interrupted_transport() {
         }
         ~SignalGuard() { sigaction(SIGUSR1, &previous, nullptr); }
     } signals;
-    const auto interrupt = [](std::jthread& thread) {
+    struct JoiningThread {
+        std::thread thread;
+        ~JoiningThread() { if (thread.joinable()) thread.join(); }
+    };
+    const auto interrupt = [](std::thread& thread) {
         for (int i = 0; i < 8; ++i) {
             std::this_thread::sleep_for(3ms);
             require(pthread_kill(thread.native_handle(), SIGUSR1) == 0, "interrupt blocked thread");
         }
     };
     auto listener = Stream::listen(tcp, loopback, 0);
-    auto sender = Stream::connect(tcp, loopback, listener.local_port());
+    auto sender = Stream::connect(tcp, loopback, listener.local_port(), 2s);
     auto peer = listener.accept(2s);
     unsigned char received = 0;
     std::exception_ptr error;
     std::latch started(1);
-    std::jthread receiver([&] {
+    JoiningThread receiver{std::thread([&] {
         started.count_down();
         try { peer.receive(&received, 1); }
         catch (...) { error = std::current_exception(); }
-    });
+    })};
     started.wait();
-    interrupt(receiver);
+    interrupt(receiver.thread);
     const unsigned char expected = 42;
     sender.send(&expected, 1);
-    receiver.join();
+    receiver.thread.join();
     if (error) std::rethrow_exception(error);
     require(received == expected, "interrupted receive lost its byte");
 
@@ -282,15 +286,15 @@ void interrupted_transport() {
     // after both signal delivery and partial progress on the socket.
     std::vector<unsigned char> output(8 * 1024 * 1024, expected), echoed(output.size());
     std::latch writing(1);
-    std::jthread writer([&] {
+    JoiningThread writer{std::thread([&] {
         writing.count_down();
         try { sender.send(output.data(), output.size()); }
         catch (...) { error = std::current_exception(); }
-    });
+    })};
     writing.wait();
-    interrupt(writer);
+    interrupt(writer.thread);
     peer.receive(echoed.data(), echoed.size());
-    writer.join();
+    writer.thread.join();
     if (error) std::rethrow_exception(error);
     require(echoed == output, "interrupted send lost or duplicated bytes");
 }

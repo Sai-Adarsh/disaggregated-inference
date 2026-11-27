@@ -15,7 +15,6 @@
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -139,10 +138,17 @@ class DecodeWorkers {
 public:
     DecodeWorkers(int capacity, bool gpu) : capacity_(capacity), gpu_(gpu) {
         workers_.reserve(capacity_);
-        for (int i = 0; i < capacity_; ++i) {
-            workers_.emplace_back([this](std::stop_token stop) { run(stop); });
+        try {
+            for (int i = 0; i < capacity_; ++i) {
+                workers_.emplace_back([this] { run(); });
+            }
+        } catch (...) {
+            drain_and_join();
+            throw;
         }
     }
+
+    ~DecodeWorkers() { drain_and_join(); }
 
     void accept_connections(const Stream& listener, int request_limit) {
         for (int accepted = 0; request_limit == 0 || accepted < request_limit;) {
@@ -161,13 +167,21 @@ public:
     }
 
 private:
-    void run(std::stop_token stop) {
+    void drain_and_join() {
+        {
+            const std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        work_available_.notify_all();
+        for (auto& worker : workers_) worker.join();
+    }
+
+    void run() {
         for (;;) {
             {
                 std::unique_lock lock(mutex_);
-                if (!work_available_.wait(lock, stop, [this] { return !pending_.empty(); })) {
-                    return;
-                }
+                work_available_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+                if (pending_.empty()) return;
                 auto client = std::move(pending_.front());
                 pending_.pop_front();
                 lock.unlock();
@@ -189,12 +203,12 @@ private:
     int capacity_;
     bool gpu_;
     int in_flight_ = 0;
+    bool stopping_ = false;
     std::mutex mutex_;
     std::condition_variable slot_available_;
-    std::condition_variable_any work_available_;
+    std::condition_variable work_available_;
     std::deque<Stream> pending_;
-    // Worker threads join before the synchronization state is destroyed.
-    std::vector<std::jthread> workers_;
+    std::vector<std::thread> workers_;
 };
 
 void serve(Stream::Kind transport, std::string_view address, int port, bool gpu,
