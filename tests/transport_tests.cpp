@@ -34,7 +34,8 @@ using namespace std::chrono_literals;
 using Clock = std::chrono::steady_clock;
 constexpr auto tcp = Stream::Kind::Tcp;
 constexpr std::string_view loopback = "127.0.0.1";
-constexpr std::uint32_t kv02 = 0x4b563032;
+constexpr std::uint32_t kv03 = 0x4b563033;
+constexpr std::uint32_t done = 0x444f4e45;
 
 void require(bool condition, std::string_view message) {
     if (!condition) throw std::runtime_error(std::string(message));
@@ -193,7 +194,7 @@ void tcp_transport() {
         auto listener = Stream::listen(tcp, loopback, 0);
         unused = listener.local_port();
         rejects<std::system_error>([&] { Stream::listen(tcp, loopback, unused); }, "bind");
-        auto sender = Stream::connect(tcp, loopback, unused);
+        auto sender = Stream::connect(tcp, loopback, unused, 1s);
         auto peer = listener.accept(1s);
         const auto moved = std::move(sender);
         const std::array<unsigned char, 4> bytes{42, 0, 255, 7};
@@ -203,6 +204,7 @@ void tcp_transport() {
         peer.receive(result.data(), result.size());
         require(result == bytes, "wrong data when reading a segmented write");
         rejects<std::system_error>([&] { peer.receive(result.data(), 1); }, "receive");
+        rejects<std::system_error>([&] { moved.receive(result.data(), 1); }, "receive");
     }
     rejects<std::system_error>([&] { Stream::connect(tcp, loopback, unused); }, "connect");
 }
@@ -277,8 +279,8 @@ void protocol(const char* exe, const std::filesystem::path& scratch) {
     Child server(exe, scratch, "loop", {"serve-loop", "tcp", std::string(loopback), "0", "2", "cpu", "6"});
     const auto port = server.port();
     const auto destination = std::to_string(port);
-    reject_packet(port, kv02 - 1, false);
-    reject_packet(port, kv02, true);
+    reject_packet(port, kv03 - 1, false);
+    reject_packet(port, kv03, true);
     { const auto closed = Stream::connect(tcp, loopback, port); }
 
     Child comparison(exe, scratch, "compare",
@@ -312,9 +314,43 @@ void parity_rejects(const char* exe, const std::filesystem::path& scratch) {
     auto peer = listener.accept(1s);
     std::array<std::uint32_t, 3 + (2 * fixture::layers + 1) * fixture::width> request{};
     peer.receive(request.data(), sizeof(request));
-    const unsigned char wrong = '!';
+    const auto expected = generation(fixture::prefill_cpu("x"), 1);
+    const unsigned char wrong = expected.front() == 'a' ? 'b' : 'a';
     peer.send(&wrong, 1);
+    const std::array completion{htonl(done), htonl(1)};
+    peer.send(completion.data(), sizeof(completion));
     expect_exit(comparison, 1, "split output differs from monolithic at token 0");
+}
+
+void completion_required(const char* exe, const std::filesystem::path& scratch) {
+    auto listener = Stream::listen(tcp, loopback, 0);
+    const auto port = std::to_string(listener.local_port());
+    const auto simulate = [&](std::string label, const std::vector<std::uint32_t>& trailer,
+                              std::string_view error, bool invalid_token = false) {
+        Child client(exe, scratch, std::move(label),
+            {"prefill", "tcp", std::string(loopback), port, "x", "1"});
+        {
+            auto peer = listener.accept(1s);
+            std::array<std::uint32_t, 3 + (2 * fixture::layers + 1) * fixture::width> request{};
+            peer.receive(request.data(), sizeof(request));
+            require(ntohl(request[0]) == kv03, "client did not request version KV03");
+            auto frame = invalid_token ? std::string("!") : generation(fixture::prefill_cpu("x"), 1);
+            if (!trailer.empty()) {
+                frame.append(reinterpret_cast<const char*>(trailer.data()), trailer.size() * sizeof(trailer[0]));
+            }
+            peer.send(frame.data(), frame.size());
+        }
+        expect_exit(client, 1, error);
+        require(client.stdout_text().size() == (invalid_token ? 0 : 1),
+                "invalid token was printed or incomplete stream reported success");
+        require(client.stderr_text().find("total_ms=") == std::string::npos,
+                "incomplete stream was included in timing");
+    };
+    simulate("no-completion", {}, "decode completion was not received");
+    simulate("half-completion", {htonl(done)}, "decode completion was not received");
+    simulate("wrong-count", {htonl(done), htonl(0)}, "invalid decode completion");
+    simulate("wrong-marker", {htonl(kv03), htonl(1)}, "invalid decode completion");
+    simulate("invalid-token", {htonl(done), htonl(1)}, "invalid decode token", true);
 }
 
 }  // namespace
@@ -327,6 +363,7 @@ int main(int argc, char** argv) try {
     interrupted_transport();
     protocol(argv[1], temp.path);
     parity_rejects(argv[1], temp.path);
+    completion_required(argv[1], temp.path);
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

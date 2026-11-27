@@ -2,7 +2,7 @@
 
 The synthetic decoder has two attention layers, four heads per layer, a hidden width of 64, and a 27-byte output vocabulary. Prefill applies dense Q/K/V projections, causal scaled dot-product softmax, and a residual output projection at every prompt position. The second layer consumes the first layer's output. The split worker receives both layers' K/V and the last hidden row. The paired command checks greedy output against a local run for the chosen prompt and backend. The recorded CPU loopback matched exactly. Weights are deterministic and untrained.
 
-The KV02 frame contains the version, prompt length and generation length, followed by network-order FP32 arrays. Both sides must use KV02. For a prompt with `T` bytes the state payload is `4 × (2 × 2 × T × 64 + 64)` bytes, plus a 12-byte header. Prefill performs quadratic attention work. Each new generated token attends over the cached prefix once per layer.
+The KV03 request has three network-order 32-bit fields for version, prompt length, and generation length, followed by network-order FP32 arrays. For a prompt with `T` bytes the state payload is `4 × (2 × 2 × T × 64 + 64)` bytes, plus the 12-byte header. The worker streams one byte per token then sends two network-order 32-bit fields, the `DONE` marker and the emitted token count, after it finishes decoding. Upgrade both workers together. A client with missing or invalid confirmation exits with an error, even if it has already printed tokens.
 
 ## Compare local and split execution
 
@@ -19,18 +19,18 @@ In a second terminal:
 ./build/split_inference prefill tcp 127.0.0.1 8123 "hello inference" 24
 ```
 
-`compare` drops one warmup pair and alternates run order. It exits on the first token mismatch and writes two CSV rows per completed pair. `ttft_ms` and `total_ms` run from client-side prefill start. `connect_send_ms` includes TCP/RDMA connection setup, serialization and the client send. It is not a measure of one-way network latency. The worker logs its own receive and decode intervals. The monolithic GPU path reuses device-resident K/V; the split GPU path stages the state on host memory.
+`compare` drops one warmup pair and alternates run order. It exits on the first mismatch and writes two CSV rows per confirmed pair. Both `ttft_ms` and `total_ms` start at client prefill. For the split path, TTFT stops at the first token and total time stops at a valid completion record. `connect_send_ms` includes connection setup, serialization, and the client send. The worker times receive and decode locally. The monolithic GPU path reuses device-resident K/V. The split GPU path stages the state in host memory.
 
-`serve` accepts one request. `serve-loop` takes 1–64 worker threads and leaves excess connections in the transport backlog. Persistent TCP connections have a 30-second idle I/O timeout. Multiple CUDA handlers share the default device stream.
+`serve` accepts one request. `serve-loop` takes 1–64 worker threads and leaves excess connections in the transport backlog. Established TCP connections have a 30-second idle read and write timeout on both endpoints. Multiple CUDA handlers share the default device stream.
 
 ### Recorded loopback run
 
-Apple M3 Pro, macOS 27.2.1, Apple Clang 21.0.0, Release build, both processes on the same host. All 48 emitted tokens agreed in each of nine measured pairs. Each split request transferred 295,168 bytes of model state plus the 12-byte header. See [the raw samples](measurements/m3-pro-tcp-loopback.csv).
+Apple M3 Pro, macOS 27.2.1, Apple Clang 21.0.0, Release build, both processes on the same host. All 48 emitted tokens agreed in each of nine measured KV03 pairs. Each split request transferred 295,168 bytes of model state plus the 12-byte header. Each response returned 48 token bytes and 8 completion bytes. [Raw samples](measurements/m3-pro-tcp-loopback.csv)
 
 | Path | Median prefill | Median TTFT | Median total |
 |---|---:|---:|---:|
-| Monolithic | 6.780 ms | 6.788 ms | 8.532 ms |
-| Split over TCP | 6.770 ms | 7.514 ms | 10.399 ms |
+| Monolithic | 6.774 ms | 6.786 ms | 8.496 ms |
+| Split over TCP | 6.878 ms | 7.742 ms | 10.345 ms |
 
 To reproduce the 288-byte prompt, use this client command with the same worker above:
 
@@ -61,7 +61,7 @@ The rsocket path transfers host buffers, so this experiment includes GPU-to-host
 
 ## Tests and coverage
 
-The suite starts real TCP workers on ephemeral loopback ports. It checks two-layer causal prefix invariance, streamed tokens, split-versus-local comparison, invalid frames, socket timeout, signal interruption, and parity rejection. For a bounded worker run, pass a connection limit after the backend. Server port `0` asks the OS for a free port, which appears in the worker log. The worker drains accepted connections before exiting.
+The suite starts TCP workers on ephemeral loopback ports. It checks causal prefix invariance, streamed tokens, split-versus-local parity, invalid frames, idle timeouts on both endpoints, and signal interruption. It sends complete token streams with missing, truncated, and invalid completion frames and checks that the client rejects them. For a bounded worker run, pass a connection limit after the backend. Server port `0` asks the OS for a free port, which appears in the worker log. The worker drains accepted connections before exiting.
 
 ```sh
 cmake -S . -B build/coverage -DCMAKE_BUILD_TYPE=Debug \
@@ -75,4 +75,4 @@ xcrun llvm-cov report build/coverage/split_inference \
   --show-branch-summary main.cpp model.cpp transport.cpp model.hpp feature.hpp transport.hpp
 ```
 
-On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The AppleClang CPU run covered 547/552 lines (99.09%) and 174/205 branches (84.88%). Uncovered CPU lines include transport initialization failure after accept and a zero-byte send. The optional CUDA and RDMA implementations require their own builds and hardware.
+On Linux, use `llvm-profdata` and `llvm-cov` from the same Clang toolchain without the `xcrun` prefix. The AppleClang CPU run covered 561/566 lines (99.12%) and 182/214 branches (85.05%). Uncovered CPU lines include transport initialization failure after accept and a zero-byte send. CUDA and RDMA verification require separate builds and hardware.

@@ -25,7 +25,8 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr std::uint32_t protocol = 0x4b563032;  // KV02, multilayer model state
+constexpr std::uint32_t protocol = 0x4b563033;  // KV03, confirms decode completion
+constexpr std::uint32_t completion_magic = 0x444f4e45;  // DONE
 constexpr int max_decode_workers = 64;
 constexpr std::chrono::seconds tcp_idle_timeout{30};
 std::mutex decode_log_mutex;
@@ -112,7 +113,11 @@ void decode_request(const Stream& client, bool gpu) {
     int steps = 0;
     auto cache = read_cache(client, steps);
     const auto received = Clock::now();
-    const auto emit = [&client](unsigned char token) { client.send(&token, 1); };
+    std::uint32_t emitted = 0;
+    const auto emit = [&client, &emitted](unsigned char token) {
+        client.send(&token, 1);
+        ++emitted;
+    };
 #ifdef INFERENCE_CUDA
     if (gpu) {
         fixture::decode_cuda(cache, steps, emit);
@@ -122,6 +127,8 @@ void decode_request(const Stream& client, bool gpu) {
         fixture::decode_cpu(std::move(cache), steps, emit);
     }
     const auto finished = Clock::now();
+    const std::array completion{htonl(completion_magic), htonl(emitted)};
+    client.send(completion.data(), sizeof(completion));
     const std::lock_guard lock(decode_log_mutex);
     std::cerr << "backend=" << (gpu ? "cuda" : "cpu")
               << " decode_tokens=" << steps << " receive_ms=" << milliseconds(received - start)
@@ -196,7 +203,7 @@ void serve(Stream::Kind transport, std::string_view address, int port, bool gpu,
     const auto bound_port = listener.local_port();
     if (workers == 0) {
         std::cerr << "listening on " << address << ':' << bound_port << '\n';
-        decode_request(listener.accept(), gpu);
+        decode_request(listener.accept(tcp_idle_timeout), gpu);
         return;
     }
 
@@ -234,15 +241,28 @@ Measurement split(Stream::Kind transport, std::string_view address, int port,
     const auto computed = Clock::now();
     measured.payload_bytes = cache.payload_bytes();
     measured.prefill_ms = milliseconds(computed - start);
-    const auto stream = Stream::connect(transport, address, port);
+    const auto stream = Stream::connect(transport, address, port, tcp_idle_timeout);
     write_cache(stream, cache, steps);
     measured.connect_send_ms = milliseconds(Clock::now() - computed);
+    constexpr std::string_view vocabulary{fixture::vocabulary};
     for (int i = 0; i < steps; ++i) {
         unsigned char next = 0;
         stream.receive(&next, 1);
+        if (vocabulary.find(static_cast<char>(next)) == std::string_view::npos) {
+            throw std::runtime_error("invalid decode token at position " + std::to_string(i));
+        }
         if (i == 0) measured.ttft_ms = milliseconds(Clock::now() - start);
         measured.tokens.push_back(static_cast<char>(next));
         if (print_tokens) std::cout << next << std::flush;
+    }
+    std::array<std::uint32_t, 2> completion{};
+    try {
+        stream.receive(completion.data(), sizeof(completion));
+    } catch (const std::runtime_error& error) {
+        throw std::runtime_error(std::string("decode completion was not received: ") + error.what());
+    }
+    if (ntohl(completion[0]) != completion_magic || ntohl(completion[1]) != measured.tokens.size()) {
+        throw std::runtime_error("invalid decode completion");
     }
     measured.total_ms = milliseconds(Clock::now() - start);
     return measured;
