@@ -31,6 +31,9 @@ void check(ssize_t result, const char* operation) {
 void configure_tcp(int fd, std::chrono::seconds idle_timeout) {
     const int on = 1;
     check(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &on, sizeof(on)), "setsockopt");
+#ifdef SO_NOSIGPIPE
+    check(setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on)), "suppress TCP SIGPIPE");
+#endif
     if (idle_timeout.count() <= 0) return;
     timeval timeout{};
     timeout.tv_sec = idle_timeout.count();
@@ -211,7 +214,12 @@ void Stream::send(const void* data, std::size_t remaining) const {
         } else
 #endif
         {
-            bytes = ::send(descriptor_, current, remaining, 0);
+#ifdef SO_NOSIGPIPE
+            constexpr int flags = 0;  // configure_tcp suppresses SIGPIPE on this socket.
+#else
+            constexpr int flags = MSG_NOSIGNAL;
+#endif
+            bytes = ::send(descriptor_, current, remaining, flags);
         }
         if (bytes < 0 && errno == EINTR) {
             continue;
