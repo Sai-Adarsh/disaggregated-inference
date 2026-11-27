@@ -207,7 +207,40 @@ void tcp_transport() {
         rejects<std::system_error>([&] { moved.receive(result.data(), 1); }, "receive");
     }
     rejects<std::system_error>([&] { Stream::connect(tcp, loopback, unused); }, "connect");
+    rejects<std::system_error>(
+        [&] { Stream::connect(tcp, loopback, unused, 1s); }, "connect");
 }
+
+#ifdef __linux__
+void tcp_connect_deadline() {
+    auto listener = Stream::listen(tcp, loopback, 0);
+    const auto port = listener.local_port();
+    // Linux queues backlog + 1 completed handshakes while no one accepts.
+    std::vector<Stream> pending;
+    for (int connection = 0; connection < 9; ++connection) {
+        pending.push_back(Stream::connect(tcp, loopback, port, 1s));
+    }
+
+    const auto child = fork();
+    require(child >= 0, "start connect deadline watchdog");
+    if (child == 0) {
+        alarm(4);
+        try {
+            const auto stalled = Stream::connect(tcp, loopback, port, 1s);
+            _exit(2);
+        } catch (const std::system_error& error) {
+            _exit(error.code() == std::errc::timed_out ? 0 : 3);
+        } catch (...) {
+            _exit(4);
+        }
+    }
+    int status = 0;
+    pid_t waited = -1;
+    do { waited = waitpid(child, &status, 0); } while (waited < 0 && errno == EINTR);
+    require(waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+            "TCP connect did not return a deadline error for a full accept queue");
+}
+#endif
 
 void interrupted_transport() {
     struct SignalGuard {
@@ -220,28 +253,32 @@ void interrupted_transport() {
         }
         ~SignalGuard() { sigaction(SIGUSR1, &previous, nullptr); }
     } signals;
-    const auto interrupt = [](std::jthread& thread) {
+    struct JoiningThread {
+        std::thread thread;
+        ~JoiningThread() { if (thread.joinable()) thread.join(); }
+    };
+    const auto interrupt = [](std::thread& thread) {
         for (int i = 0; i < 8; ++i) {
             std::this_thread::sleep_for(3ms);
             require(pthread_kill(thread.native_handle(), SIGUSR1) == 0, "interrupt blocked thread");
         }
     };
     auto listener = Stream::listen(tcp, loopback, 0);
-    auto sender = Stream::connect(tcp, loopback, listener.local_port());
+    auto sender = Stream::connect(tcp, loopback, listener.local_port(), 2s);
     auto peer = listener.accept(2s);
     unsigned char received = 0;
     std::exception_ptr error;
     std::latch started(1);
-    std::jthread receiver([&] {
+    JoiningThread receiver{std::thread([&] {
         started.count_down();
         try { peer.receive(&received, 1); }
         catch (...) { error = std::current_exception(); }
-    });
+    })};
     started.wait();
-    interrupt(receiver);
+    interrupt(receiver.thread);
     const unsigned char expected = 42;
     sender.send(&expected, 1);
-    receiver.join();
+    receiver.thread.join();
     if (error) std::rethrow_exception(error);
     require(received == expected, "interrupted receive lost its byte");
 
@@ -249,15 +286,15 @@ void interrupted_transport() {
     // after both signal delivery and partial progress on the socket.
     std::vector<unsigned char> output(8 * 1024 * 1024, expected), echoed(output.size());
     std::latch writing(1);
-    std::jthread writer([&] {
+    JoiningThread writer{std::thread([&] {
         writing.count_down();
         try { sender.send(output.data(), output.size()); }
         catch (...) { error = std::current_exception(); }
-    });
+    })};
     writing.wait();
-    interrupt(writer);
+    interrupt(writer.thread);
     peer.receive(echoed.data(), echoed.size());
-    writer.join();
+    writer.thread.join();
     if (error) std::rethrow_exception(error);
     require(echoed == output, "interrupted send lost or duplicated bytes");
 }
@@ -360,6 +397,9 @@ int main(int argc, char** argv) try {
     const TempDir temp;
     model_prefix();
     tcp_transport();
+#ifdef __linux__
+    tcp_connect_deadline();
+#endif
     interrupted_transport();
     protocol(argv[1], temp.path);
     parity_rejects(argv[1], temp.path);

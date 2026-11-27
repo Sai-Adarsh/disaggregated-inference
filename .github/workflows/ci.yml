@@ -15,18 +15,24 @@ concurrency:
 jobs:
   ctest:
     name: CTest (${{ matrix.name }})
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: tcp
+            runner: ubuntu-24.04
             option: -DENABLE_RDMA=OFF
             install-dependency: false
           - name: rdma-build
+            runner: ubuntu-24.04
             option: -DENABLE_RDMA=ON
             install-dependency: true
+          - name: tcp-macos
+            runner: macos-15
+            option: -DENABLE_RDMA=OFF
+            install-dependency: false
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

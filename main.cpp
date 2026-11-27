@@ -15,7 +15,6 @@
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
-#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -28,7 +27,7 @@ using Clock = std::chrono::steady_clock;
 constexpr std::uint32_t protocol = 0x4b563033;  // KV03, confirms decode completion
 constexpr std::uint32_t completion_magic = 0x444f4e45;  // DONE
 constexpr int max_decode_workers = 64;
-constexpr std::chrono::seconds tcp_idle_timeout{30};
+constexpr std::chrono::seconds tcp_timeout{30};
 std::mutex decode_log_mutex;
 
 double milliseconds(Clock::duration duration) {
@@ -139,10 +138,17 @@ class DecodeWorkers {
 public:
     DecodeWorkers(int capacity, bool gpu) : capacity_(capacity), gpu_(gpu) {
         workers_.reserve(capacity_);
-        for (int i = 0; i < capacity_; ++i) {
-            workers_.emplace_back([this](std::stop_token stop) { run(stop); });
+        try {
+            for (int i = 0; i < capacity_; ++i) {
+                workers_.emplace_back([this] { run(); });
+            }
+        } catch (...) {
+            drain_and_join();
+            throw;
         }
     }
+
+    ~DecodeWorkers() { drain_and_join(); }
 
     void accept_connections(const Stream& listener, int request_limit) {
         for (int accepted = 0; request_limit == 0 || accepted < request_limit;) {
@@ -150,7 +156,7 @@ public:
             slot_available_.wait(lock, [this] { return in_flight_ < capacity_; });
             lock.unlock();
 
-            auto client = listener.accept(tcp_idle_timeout);
+            auto client = listener.accept(tcp_timeout);
             lock.lock();
             pending_.push_back(std::move(client));
             ++in_flight_;
@@ -161,13 +167,21 @@ public:
     }
 
 private:
-    void run(std::stop_token stop) {
+    void drain_and_join() {
+        {
+            const std::lock_guard lock(mutex_);
+            stopping_ = true;
+        }
+        work_available_.notify_all();
+        for (auto& worker : workers_) worker.join();
+    }
+
+    void run() {
         for (;;) {
             {
                 std::unique_lock lock(mutex_);
-                if (!work_available_.wait(lock, stop, [this] { return !pending_.empty(); })) {
-                    return;
-                }
+                work_available_.wait(lock, [this] { return stopping_ || !pending_.empty(); });
+                if (pending_.empty()) return;
                 auto client = std::move(pending_.front());
                 pending_.pop_front();
                 lock.unlock();
@@ -189,12 +203,12 @@ private:
     int capacity_;
     bool gpu_;
     int in_flight_ = 0;
+    bool stopping_ = false;
     std::mutex mutex_;
     std::condition_variable slot_available_;
-    std::condition_variable_any work_available_;
+    std::condition_variable work_available_;
     std::deque<Stream> pending_;
-    // Worker threads join before the synchronization state is destroyed.
-    std::vector<std::jthread> workers_;
+    std::vector<std::thread> workers_;
 };
 
 void serve(Stream::Kind transport, std::string_view address, int port, bool gpu,
@@ -203,7 +217,7 @@ void serve(Stream::Kind transport, std::string_view address, int port, bool gpu,
     const auto bound_port = listener.local_port();
     if (workers == 0) {
         std::cerr << "listening on " << address << ':' << bound_port << '\n';
-        decode_request(listener.accept(tcp_idle_timeout), gpu);
+        decode_request(listener.accept(tcp_timeout), gpu);
         return;
     }
 
@@ -241,7 +255,7 @@ Measurement split(Stream::Kind transport, std::string_view address, int port,
     const auto computed = Clock::now();
     measured.payload_bytes = cache.payload_bytes();
     measured.prefill_ms = milliseconds(computed - start);
-    const auto stream = Stream::connect(transport, address, port, tcp_idle_timeout);
+    const auto stream = Stream::connect(transport, address, port, tcp_timeout);
     write_cache(stream, cache, steps);
     measured.connect_send_ms = milliseconds(Clock::now() - computed);
     constexpr std::string_view vocabulary{fixture::vocabulary};
