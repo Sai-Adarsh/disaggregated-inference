@@ -3,6 +3,7 @@
 
 #include <arpa/inet.h>
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <charconv>
@@ -15,6 +16,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <stop_token>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -23,7 +25,7 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
-constexpr std::uint32_t protocol = 0x4b563031;  // KV01
+constexpr std::uint32_t protocol = 0x4b563032;  // KV02, multilayer model state
 constexpr int max_decode_workers = 64;
 constexpr std::chrono::seconds tcp_idle_timeout{30};
 std::mutex decode_log_mutex;
@@ -57,45 +59,51 @@ bool use_cuda(std::string_view backend) {
 
 void write_cache(const Stream& stream, const fixture::Cache& cache, int steps) {
     const std::array header{htonl(protocol), htonl(static_cast<std::uint32_t>(cache.size())),
-                            htonl(steps), htonl(cache.last)};
+                            htonl(steps)};
     stream.send(header.data(), sizeof(header));
     std::vector<std::uint32_t> payload;
-    payload.reserve(cache.keys.size() + cache.values.size());
-    for (const auto& matrix : {&cache.keys, &cache.values}) {
-        for (const float value : *matrix) {
-            payload.push_back(htonl(std::bit_cast<std::uint32_t>(value)));
-        }
+    payload.reserve(cache.payload_bytes() / sizeof(float));
+    const auto append = [&payload](const auto& values) {
+        for (const float value : values) payload.push_back(htonl(std::bit_cast<std::uint32_t>(value)));
+    };
+    for (const auto& layer : cache.attention) {
+        append(layer.keys);
+        append(layer.values);
     }
+    append(cache.hidden);
     stream.send(payload.data(), payload.size() * sizeof(payload[0]));
 }
 
 fixture::Cache read_cache(const Stream& stream, int& steps) {
-    std::array<std::uint32_t, 4> header{};
+    std::array<std::uint32_t, 3> header{};
     stream.receive(header.data(), sizeof(header));
     const auto rows = ntohl(header[1]);
     const auto requested_steps = ntohl(header[2]);
-    const auto last = ntohl(header[3]);
     if (ntohl(header[0]) != protocol || rows == 0 || rows > fixture::max_prompt
-        || requested_steps == 0 || requested_steps > fixture::max_generated || last > 255) {
+        || requested_steps == 0 || requested_steps > fixture::max_generated) {
         throw std::runtime_error("incompatible KV handoff header");
     }
     steps = static_cast<int>(requested_steps);
     const auto matrix_elements = std::size_t{rows} * fixture::width;
-    std::vector<std::uint32_t> payload(2 * matrix_elements);
+    std::vector<std::uint32_t> payload(2 * fixture::layers * matrix_elements + fixture::width);
     stream.receive(payload.data(), payload.size() * sizeof(payload[0]));
     fixture::Cache cache;
-    cache.keys.resize(matrix_elements);
-    cache.values.resize(matrix_elements);
-    cache.last = static_cast<unsigned char>(last);
-    for (std::size_t i = 0; i < matrix_elements; ++i) {
-        const auto key = std::bit_cast<float>(ntohl(payload[i]));
-        const auto value = std::bit_cast<float>(ntohl(payload[matrix_elements + i]));
-        if (!std::isfinite(key) || !std::isfinite(value) || std::abs(key) > 1 || std::abs(value) > 1) {
-            throw std::runtime_error("invalid fixture KV entry");
+    auto cursor = payload.cbegin();
+    const auto read = [&cursor](auto& values) {
+        for (auto& value : values) {
+            value = std::bit_cast<float>(ntohl(*cursor++));
+            if (!std::isfinite(value) || std::abs(value) > 1.0e6F) {
+                throw std::runtime_error("invalid fixture state entry");
+            }
         }
-        cache.keys[i] = key;
-        cache.values[i] = value;
+    };
+    for (auto& layer : cache.attention) {
+        layer.keys.resize(matrix_elements);
+        layer.values.resize(matrix_elements);
+        read(layer.keys);
+        read(layer.values);
     }
+    read(cache.hidden);
     return cache;
 }
 
@@ -194,11 +202,25 @@ void serve(Stream::Kind transport, std::string_view address, int port, bool gpu,
     pool.accept_connections(listener);
 }
 
-void prefill(Stream::Kind transport, std::string_view address, int port,
-             std::string_view prompt, int steps, bool gpu) {
+struct Measurement {
+    std::string tokens;
+    std::size_t payload_bytes = 0;
+    double prefill_ms = 0;
+    double connect_send_ms = 0;
+    double ttft_ms = 0;
+    double total_ms = 0;
+};
+
+void check_prompt(std::string_view prompt) {
     if (prompt.empty() || prompt.size() > fixture::max_prompt) {
         throw std::invalid_argument("prompt must contain 1–8192 bytes");
     }
+}
+
+Measurement split(Stream::Kind transport, std::string_view address, int port,
+                  std::string_view prompt, int steps, bool gpu, bool print_tokens) {
+    Measurement measured;
+    measured.tokens.reserve(steps);
 
     const auto start = Clock::now();
     const auto cache =
@@ -207,24 +229,86 @@ void prefill(Stream::Kind transport, std::string_view address, int port,
 #endif
         fixture::prefill_cpu(prompt);
     const auto computed = Clock::now();
+    measured.payload_bytes = cache.payload_bytes();
+    measured.prefill_ms = milliseconds(computed - start);
     const auto stream = Stream::connect(transport, address, port);
     write_cache(stream, cache, steps);
-
-    unsigned char next = 0;
-    stream.receive(&next, 1);
-    const auto first_token = Clock::now();
-    std::cout << next << std::flush;
-    for (int i = 1; i < steps; ++i) {
+    measured.connect_send_ms = milliseconds(Clock::now() - computed);
+    for (int i = 0; i < steps; ++i) {
+        unsigned char next = 0;
         stream.receive(&next, 1);
-        std::cout << next << std::flush;
+        if (i == 0) measured.ttft_ms = milliseconds(Clock::now() - start);
+        measured.tokens.push_back(static_cast<char>(next));
+        if (print_tokens) std::cout << next << std::flush;
     }
-    const auto finished = Clock::now();
+    measured.total_ms = milliseconds(Clock::now() - start);
+    return measured;
+}
+
+Measurement local(std::string_view prompt, int steps, bool gpu) {
+    Measurement measured;
+    measured.tokens.reserve(steps);
+    const auto start = Clock::now();
+    const auto emit = [&](unsigned char next) {
+        if (measured.tokens.empty()) measured.ttft_ms = milliseconds(Clock::now() - start);
+        measured.tokens.push_back(static_cast<char>(next));
+    };
+    const auto prefilled = [&] { measured.prefill_ms = milliseconds(Clock::now() - start); };
+#ifdef INFERENCE_CUDA
+    if (gpu) {
+        fixture::monolithic_cuda(prompt, steps, emit, prefilled);
+    } else
+#endif
+    {
+        auto cache = fixture::prefill_cpu(prompt);
+        prefilled();
+        fixture::decode_cpu(std::move(cache), steps, emit);
+    }
+    measured.total_ms = milliseconds(Clock::now() - start);
+    return measured;
+}
+
+void prefill(Stream::Kind transport, std::string_view address, int port,
+             std::string_view prompt, int steps, bool gpu) {
+    check_prompt(prompt);
+    const auto measured = split(transport, address, port, prompt, steps, gpu, true);
     std::cout << '\n';
     std::cerr << "backend=" << (gpu ? "cuda" : "cpu")
-              << " prompt_bytes=" << prompt.size() << " kv_bytes=" << 2 * cache.keys.size() * sizeof(float)
-              << " prefill_ms=" << milliseconds(computed - start)
-              << " ttft_ms=" << milliseconds(first_token - start)
-              << " total_ms=" << milliseconds(finished - start) << '\n';
+              << " prompt_bytes=" << prompt.size() << " state_bytes=" << measured.payload_bytes
+              << " prefill_ms=" << measured.prefill_ms << " connect_send_ms=" << measured.connect_send_ms
+              << " ttft_ms=" << measured.ttft_ms << " total_ms=" << measured.total_ms << '\n';
+}
+
+void compare(Stream::Kind transport, std::string_view address, int port,
+             std::string_view prompt, int steps, int trials, bool gpu) {
+    check_prompt(prompt);
+    std::cout << "trial,path,prefill_backend,prompt_tokens,output_tokens,state_bytes,prefill_ms,connect_send_ms,ttft_ms,total_ms\n";
+    for (int trial = 0; trial <= trials; ++trial) {
+        Measurement monolithic, disaggregated;
+        // Exclude one warmup pair and rotate the order of subsequent pairs.
+        if (trial % 2 == 0) {
+            monolithic = local(prompt, steps, gpu);
+            disaggregated = split(transport, address, port, prompt, steps, gpu, false);
+        } else {
+            disaggregated = split(transport, address, port, prompt, steps, gpu, false);
+            monolithic = local(prompt, steps, gpu);
+        }
+        if (monolithic.tokens != disaggregated.tokens) {
+            const auto mismatch = std::mismatch(monolithic.tokens.begin(), monolithic.tokens.end(),
+                                               disaggregated.tokens.begin(), disaggregated.tokens.end());
+            throw std::runtime_error("split output differs from monolithic at token "
+                + std::to_string(mismatch.first - monolithic.tokens.begin()));
+        }
+        if (trial == 0) continue;
+        const auto print = [&](std::string_view path, const Measurement& m) {
+            std::cout << trial << ',' << path << ',' << (gpu ? "cuda" : "cpu") << ',' << prompt.size()
+                      << ',' << m.tokens.size() << ',' << m.payload_bytes << ',' << m.prefill_ms << ','
+                      << m.connect_send_ms << ',' << m.ttft_ms << ',' << m.total_ms << '\n';
+        };
+        print("monolithic", monolithic);
+        print("split", disaggregated);
+    }
+    std::cerr << "parity=exact pairs=" << trials << " warmup_pairs=1 tokens_per_pair=" << steps << '\n';
 }
 
 }  // namespace
@@ -234,7 +318,8 @@ int main(int argc, char** argv) try {
     if (argc < 5) {
         throw std::invalid_argument("usage: split_inference serve tcp|rdma IP PORT [cpu|cuda]\n"
                                     "       split_inference serve-loop tcp|rdma IP PORT WORKERS [cpu|cuda]\n"
-                                    "       split_inference prefill tcp|rdma IP PORT PROMPT STEPS [cpu|cuda]");
+                                    "       split_inference prefill tcp|rdma IP PORT PROMPT STEPS [cpu|cuda]\n"
+                                    "       split_inference compare tcp|rdma IP PORT PROMPT STEPS TRIALS [cpu|cuda]");
     }
     const std::string_view mode = argv[1];
     const std::string_view protocol_name = argv[2];
@@ -251,6 +336,9 @@ int main(int argc, char** argv) try {
     } else if (mode == "prefill" && (argc == 7 || argc == 8)) {
         prefill(transport, argv[3], port, argv[5], parse_int(argv[6], 1, fixture::max_generated),
                 use_cuda(argc == 8 ? argv[7] : "cpu"));
+    } else if (mode == "compare" && (argc == 8 || argc == 9)) {
+        compare(transport, argv[3], port, argv[5], parse_int(argv[6], 1, fixture::max_generated),
+                parse_int(argv[7], 1, 1000), use_cuda(argc == 9 ? argv[8] : "cpu"));
     } else {
         throw std::invalid_argument("invalid mode or argument count");
     }
