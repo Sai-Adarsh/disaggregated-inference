@@ -244,9 +244,13 @@ Measurement split(Stream::Kind transport, std::string_view address, int port,
     const auto stream = Stream::connect(transport, address, port, tcp_idle_timeout);
     write_cache(stream, cache, steps);
     measured.connect_send_ms = milliseconds(Clock::now() - computed);
+    constexpr std::string_view vocabulary{fixture::vocabulary};
     for (int i = 0; i < steps; ++i) {
         unsigned char next = 0;
         stream.receive(&next, 1);
+        if (vocabulary.find(static_cast<char>(next)) == std::string_view::npos) {
+            throw std::runtime_error("invalid decode token at position " + std::to_string(i));
+        }
         if (i == 0) measured.ttft_ms = milliseconds(Clock::now() - start);
         measured.tokens.push_back(static_cast<char>(next));
         if (print_tokens) std::cout << next << std::flush;

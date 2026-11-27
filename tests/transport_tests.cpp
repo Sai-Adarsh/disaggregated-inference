@@ -334,9 +334,11 @@ void completion_required(const char* exe, const std::filesystem::path& scratch) 
             std::array<std::uint32_t, 3 + (2 * fixture::layers + 1) * fixture::width> request{};
             peer.receive(request.data(), sizeof(request));
             require(ntohl(request[0]) == kv03, "client did not request version KV03");
-            const auto token = invalid_token ? std::string("!") : generation(fixture::prefill_cpu("x"), 1);
-            peer.send(token.data(), token.size());
-            if (!trailer.empty()) peer.send(trailer.data(), trailer.size() * sizeof(trailer[0]));
+            auto frame = invalid_token ? std::string("!") : generation(fixture::prefill_cpu("x"), 1);
+            if (!trailer.empty()) {
+                frame.append(reinterpret_cast<const char*>(trailer.data()), trailer.size() * sizeof(trailer[0]));
+            }
+            peer.send(frame.data(), frame.size());
         }
         expect_exit(client, 1, error);
         require(client.stdout_text().size() == (invalid_token ? 0 : 1),
